@@ -1,0 +1,47 @@
+name: Kaylee Linux driver
+
+on:
+  pull_request:
+    branches: [kaylee-stable]
+    paths: ["libs/cua-driver/rust/**", ".github/workflows/kaylee-linux-driver.yml"]
+  push:
+    branches: [kaylee-stable]
+    paths: ["libs/cua-driver/rust/**", ".github/workflows/kaylee-linux-driver.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-driver:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: libs/cua-driver/rust
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libx11-dev libxi-dev libxtst-dev libxext-dev libwayland-dev libxkbcommon-dev
+      - name: Check Hyprland safety contracts and browser story compilation
+        working-directory: libs/cua-driver/rust
+        run: |
+          cargo test --locked -p platform-linux --lib
+          cargo test --locked -p cua-driver --test hyprland_browser_roundtrip_test --no-run
+      - name: Build reviewed native executable
+        working-directory: libs/cua-driver/rust
+        run: cargo build --locked -p cua-driver --release --features portal-input
+      - name: Record exact artifact provenance
+        run: |
+          mkdir -p native-release
+          cp libs/cua-driver/rust/target/release/cua-driver native-release/cua-driver-linux-x86_64
+          printf '%s\n' "$GITHUB_SHA" > native-release/source-sha
+          (cd native-release && sha256sum cua-driver-linux-x86_64 > SHA256SUMS)
+          native-release/cua-driver-linux-x86_64 --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kaylee-linux-driver-${{ github.sha }}
+          path: native-release/
+          if-no-files-found: error

@@ -85,6 +85,7 @@ pub enum ActionTransport {
     LinuxXTest,
     LinuxLibei,
     LinuxWaylandVirtualPointer,
+    LinuxWaylandVirtualKeyboard,
     LinuxCuaCompositorInject,
     LinuxHyprlandIsolatedInput,
     LinuxHyprlandForegroundInput,
@@ -123,6 +124,7 @@ impl ActionTransport {
         Self::LinuxXTest,
         Self::LinuxLibei,
         Self::LinuxWaylandVirtualPointer,
+        Self::LinuxWaylandVirtualKeyboard,
         Self::LinuxCuaCompositorInject,
         Self::LinuxHyprlandIsolatedInput,
         Self::LinuxHyprlandForegroundInput,
@@ -161,6 +163,7 @@ impl ActionTransport {
             | Self::LinuxXTest
             | Self::LinuxLibei
             | Self::LinuxWaylandVirtualPointer
+            | Self::LinuxWaylandVirtualKeyboard
             | Self::LinuxHyprlandForegroundInput
             | Self::LinuxCuaCompositorInject => ActionRoute::GlobalInput,
             Self::WindowsSetWindowPos | Self::LinuxX11ConfigureWindow => ActionRoute::SystemApi,
@@ -1031,6 +1034,7 @@ fn transport_name(transport: ActionTransport) -> &'static str {
         ActionTransport::LinuxXTest => "linux_x_test",
         ActionTransport::LinuxLibei => "linux_libei",
         ActionTransport::LinuxWaylandVirtualPointer => "linux_wayland_virtual_pointer",
+        ActionTransport::LinuxWaylandVirtualKeyboard => "linux_wayland_virtual_keyboard",
         ActionTransport::LinuxCuaCompositorInject => "linux_cua_compositor_inject",
         ActionTransport::LinuxHyprlandIsolatedInput => "linux_hyprland_isolated_input",
         ActionTransport::LinuxHyprlandForegroundInput => "linux_hyprland_foreground_input",
