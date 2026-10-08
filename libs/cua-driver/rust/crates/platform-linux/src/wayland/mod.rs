@@ -71,10 +71,9 @@ const BTN_LEFT: u32 = 0x110;
 use crate::x11::WindowInfo;
 
 thread_local! {
-    /// Exact foreground target currently held by an outer compositor guard.
-    /// Focus-bound helpers use this only to re-enter the guard after a blocking
-    /// portal/libei readiness wait, so the actual input is preceded by a fresh
-    /// compositor verification rather than relying on a stale pre-wait check.
+    /// Exact foreground target currently checked by an outer compositor guard.
+    /// Focus-bound helpers revalidate it after child focus/readiness work and
+    /// immediately before keyboard transport; this is not an atomic focus lease.
     static CURRENT_FOREGROUND_TARGET: std::cell::Cell<Option<(u32, u64)>> =
         const { std::cell::Cell::new(None) };
 }
@@ -94,6 +93,19 @@ fn bind_foreground_target(pid: u32, window_id: u64) -> ForegroundTargetGuard {
 
 fn current_foreground_target() -> Option<(u32, u64)> {
     CURRENT_FOREGROUND_TARGET.with(std::cell::Cell::get)
+}
+
+fn revalidate_focused_keyboard_target() -> anyhow::Result<()> {
+    if !is_wayland() || !hyprland::is_session() {
+        return Ok(());
+    }
+    let (pid, window_id) = current_foreground_target().ok_or_else(|| {
+        anyhow::anyhow!(
+            "foreground_unavailable: stock Hyprland keyboard input requires an exact PID/window foreground guard"
+        )
+    })?;
+    hyprland::require_target_focus(window_id, pid)?;
+    Ok(())
 }
 
 /// Name of the opt-in env var that unlocks the experimental native-Wayland
@@ -1342,10 +1354,14 @@ pub fn open_vptr_session(activate_window_id: Option<u64>) -> anyhow::Result<Vptr
 /// compositors must refuse until they provide an equally target-addressable
 /// adapter, because global injection without this gate can affect the wrong app.
 pub fn activate_window_for_input(window_id: u64) -> anyhow::Result<()> {
-    let pid = crate::atspi::list_windows(None)
-        .into_iter()
-        .find(|window| window.xid == window_id)
-        .and_then(|window| window.pid);
+    let pid = if is_wayland() && hyprland::is_session() {
+        hyprland::window_for_address(window_id).map(|window| window.pid)
+    } else {
+        crate::atspi::list_windows(None)
+            .into_iter()
+            .find(|window| window.xid == window_id)
+            .and_then(|window| window.pid)
+    };
     activate_window_for_input_target(window_id, pid)
 }
 
@@ -1357,13 +1373,19 @@ pub fn activate_window_for_input_target(
     target_pid: Option<u32>,
 ) -> anyhow::Result<()> {
     if is_wayland() && hyprland::is_session() {
-        // A full compositor address must never enter the generic protocol-id
-        // or title-matching route. This observation-only adapter can attest an
-        // already-active target, but cannot switch focus to a different one.
-        if hyprland::target_is_active(window_id, target_pid)? {
-            return Ok(());
+        // Full native addresses never enter generic protocol-id/title routes.
+        let pid = target_pid.ok_or_else(|| {
+            anyhow::anyhow!(
+                "foreground_unavailable: Hyprland activation requires the exact target PID"
+            )
+        })?;
+        if let Some(bound) = current_foreground_target() {
+            if bound != (pid, window_id) {
+                anyhow::bail!("foreground_unavailable: nested Hyprland activation changed target");
+            }
+            return hyprland::require_target_focus(window_id, pid);
         }
-        anyhow::bail!("foreground_unavailable: exact-address Hyprland activation is not implemented; refusing title-based activation");
+        return hyprland::activate_window(window_id, pid);
     }
     if is_inject_mode() {
         let pid = target_pid.ok_or_else(|| {
@@ -1432,7 +1454,20 @@ pub fn with_target_foreground<T>(
     window_id: u64,
     body: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
+    let previous = current_foreground_target();
     let _target_guard = bind_foreground_target(pid, window_id);
+    if is_wayland() && hyprland::is_session() {
+        if let Some(previous) = previous {
+            if previous != (pid, window_id) {
+                anyhow::bail!("foreground_unavailable: nested Hyprland foreground target changed");
+            }
+            // Re-entry after readiness never wrests independently changed focus
+            // back, and does not acquire the outer transaction's mutex again.
+            hyprland::require_target_focus(window_id, pid)?;
+            return body();
+        }
+        return hyprland::with_focused_window(pid, window_id, body);
+    }
     if let Some(window) = sway_ipc::window_for_id(window_id) {
         if window.pid != pid {
             anyhow::bail!(
@@ -1946,6 +1981,14 @@ pub fn type_text(window_id: u64, text: &str) -> anyhow::Result<()> {
     if text.is_empty() {
         return Ok(());
     }
+    if is_wayland() && hyprland::is_session() {
+        let pid = hyprland::window_for_address(window_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("foreground_unavailable: exact Hyprland window no longer exists")
+            })?
+            .pid;
+        return with_target_foreground(pid, window_id, || type_text_focused(text));
+    }
     activate_window_for_input(window_id)?;
     // Lead with a no-op Shift_L tap: on a freshly-focused window under a headless
     // seat (notably sway), the compositor needs the first virtual-keyboard event
@@ -1973,13 +2016,13 @@ pub fn type_text(window_id: u64, text: &str) -> anyhow::Result<()> {
     }
 }
 
-/// Type into a surface whose exact Sway container is already held focused by
-/// the caller. This avoids re-resolving a title that can change mid-sequence
-/// (for example after opening a Chromium tab).
+/// Type while the caller's exact compositor target is checked. Revalidate after
+/// child AX focus; virtual-keyboard events themselves are not window-bound.
 pub fn type_text_focused(text: &str) -> anyhow::Result<()> {
     if text.is_empty() {
         return Ok(());
     }
+    revalidate_focused_keyboard_target()?;
     let result = std::process::Command::new("wtype")
         .args(["-k", "Shift_L", "--"])
         .arg(text)
@@ -1989,6 +2032,7 @@ pub fn type_text_focused(text: &str) -> anyhow::Result<()> {
         other => with_wtype_libei_fallback(
             || {
                 libei_wait_keyboard_ready()?;
+                revalidate_focused_keyboard_target()?;
                 libei_type_text(text)
             },
             other.map(|out| String::from_utf8_lossy(&out.stderr).into_owned()),
@@ -2002,6 +2046,7 @@ pub fn type_text_focused(text: &str) -> anyhow::Result<()> {
 /// process after the text has landed.
 pub fn type_text_then_key_focused(text: &str, key: &str) -> anyhow::Result<()> {
     let keysym = key_to_keysym(key);
+    revalidate_focused_keyboard_target()?;
     let result = std::process::Command::new("wtype")
         .args(["-k", "Shift_L", "-s", "30"])
         .arg(text)
@@ -2012,7 +2057,9 @@ pub fn type_text_then_key_focused(text: &str, key: &str) -> anyhow::Result<()> {
         other => with_wtype_libei_fallback(
             || {
                 libei_wait_keyboard_ready()?;
+                revalidate_focused_keyboard_target()?;
                 libei_type_text(text)?;
+                revalidate_focused_keyboard_target()?;
                 libei_press_key(key)
             },
             other.map(|out| String::from_utf8_lossy(&out.stderr).into_owned()),
@@ -2022,6 +2069,14 @@ pub fn type_text_then_key_focused(text: &str, key: &str) -> anyhow::Result<()> {
 
 /// Press a single named key into the focused Wayland surface via `wtype -k`.
 pub fn press_key(window_id: u64, key: &str) -> anyhow::Result<()> {
+    if is_wayland() && hyprland::is_session() {
+        let pid = hyprland::window_for_address(window_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("foreground_unavailable: exact Hyprland window no longer exists")
+            })?
+            .pid;
+        return with_target_foreground(pid, window_id, || press_key_focused(key));
+    }
     activate_window_for_input(window_id)?;
     let keysym = key_to_keysym(key);
     // Keep the sacrificial modifier and requested key in one virtual-keyboard
@@ -2050,6 +2105,7 @@ pub fn press_key_focused(key: &str) -> anyhow::Result<()> {
         return inject_press_key(pid, window_id, key);
     }
     let keysym = key_to_keysym(key);
+    revalidate_focused_keyboard_target()?;
     let result = std::process::Command::new("wtype")
         .args(["-k", "Shift_L", "-k", &keysym])
         .output();
@@ -2058,6 +2114,7 @@ pub fn press_key_focused(key: &str) -> anyhow::Result<()> {
         other => with_wtype_libei_fallback(
             || {
                 libei_wait_keyboard_ready()?;
+                revalidate_focused_keyboard_target()?;
                 libei_press_key(key)
             },
             other.map(|out| String::from_utf8_lossy(&out.stderr).into_owned()),
@@ -2071,6 +2128,14 @@ pub fn press_key_focused(key: &str) -> anyhow::Result<()> {
 /// straight to wtype's `-k` so single-character keys and X keysym names work
 /// as-is. This is the Wayland equivalent of the X11 `send_key` modifier mask.
 pub fn hotkey(window_id: u64, keys: &[String]) -> anyhow::Result<()> {
+    if is_wayland() && hyprland::is_session() {
+        let pid = hyprland::window_for_address(window_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("foreground_unavailable: exact Hyprland window no longer exists")
+            })?
+            .pid;
+        return with_target_foreground(pid, window_id, || hotkey_focused(keys));
+    }
     activate_window_for_input(window_id)?;
     let (mods, final_key) = partition_modifiers(keys)?;
     if let Ok(()) = virtual_keyboard::hotkey(&mods, &final_key) {
@@ -2113,11 +2178,13 @@ pub fn hotkey_focused(keys: &[String]) -> anyhow::Result<()> {
         return inject_hotkey(pid, window_id, keys);
     }
     let (mods, final_key) = partition_modifiers(keys)?;
-    if let Ok(()) = virtual_keyboard::hotkey(&mods, &final_key) {
+    let stock_hyprland = is_wayland() && hyprland::is_session();
+    if !stock_hyprland && virtual_keyboard::hotkey(&mods, &final_key).is_ok() {
         return Ok(());
     }
     let keysym = key_to_keysym(&final_key);
     let args = wtype_hotkey_args(&mods, &keysym);
+    revalidate_focused_keyboard_target()?;
     let result = std::process::Command::new("wtype").args(&args).output();
     match result {
         Ok(out) if out.status.success() => Ok(()),
@@ -2128,6 +2195,7 @@ pub fn hotkey_focused(keys: &[String]) -> anyhow::Result<()> {
                 return with_wtype_libei_fallback(
                     || {
                         libei::wait_keyboard_ready()?;
+                        revalidate_focused_keyboard_target()?;
                         libei_hotkey(&mods, &final_key)
                     },
                     stderr,
@@ -2237,6 +2305,14 @@ fn with_wtype_libei_fallback(
     #[allow(unused_variables)] run: impl FnOnce() -> anyhow::Result<()>,
     wtype_err: Result<String, std::io::Error>,
 ) -> anyhow::Result<()> {
+    if is_wayland() && hyprland::is_session() {
+        // A failed wtype process may already have emitted keys. Stock Hyprland
+        // never replays uncertain text/chords through libei or another backend.
+        return match wtype_err {
+            Ok(stderr) => anyhow::bail!("Hyprland wtype input failed; outcome may be partial and was not replayed: {stderr}"),
+            Err(error) => anyhow::bail!("Hyprland wtype input failed and was not replayed: {error}"),
+        };
+    }
     #[cfg(feature = "portal-input")]
     {
         match wtype_err {

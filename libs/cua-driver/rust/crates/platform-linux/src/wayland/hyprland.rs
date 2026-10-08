@@ -1,7 +1,7 @@
-//! Read-only Hyprland identity and geometry, adapted from #3052.
+//! Attested Hyprland identity, capture and explicit foreground activation.
 //!
 //! Native IDs are full compositor addresses, never title matches or truncated
-//! protocol object IDs. IPC and capture must belong to the same compositor.
+//! protocol object IDs. IPC, capture and focus must name the same compositor.
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -9,7 +9,8 @@ use std::collections::HashSet;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(1);
@@ -18,6 +19,9 @@ const QUERY_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 const QUERY_MAX_ATTEMPTS: usize = 2;
 const MAX_REPLY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_LOGICAL_PIXELS: u64 = 64 * 1024 * 1024;
+const MAX_INSTANCE_ENTRIES: usize = 32;
+const FOCUS_TIMEOUT: Duration = Duration::from_millis(500);
+const FOCUS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 struct Workspace {
@@ -70,27 +74,158 @@ pub struct Window {
     hidden: bool,
 }
 
-pub fn is_session() -> bool {
-    !super::is_inject_mode()
-        && std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some_and(|s| !s.is_empty())
+struct Session {
+    ipc_path: PathBuf,
+    wayland_path: PathBuf,
+    peer: OnceLock<libc::pid_t>,
 }
 
-fn ipc_path() -> Result<PathBuf> {
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR").context("missing XDG_RUNTIME_DIR")?;
-    let signature = std::env::var("HYPRLAND_INSTANCE_SIGNATURE")
-        .context("missing HYPRLAND_INSTANCE_SIGNATURE")?;
-    if signature.is_empty()
-        || !signature
+enum SessionSelection {
+    Absent,
+    Ready(Session),
+    Refused(String),
+}
+
+// The driver session environment is immutable. Discovery happens once, never
+// on a capture/input hot path or again after an identity failure.
+static SESSION: LazyLock<SessionSelection> = LazyLock::new(resolve_session);
+
+fn resolve_session() -> SessionSelection {
+    if super::is_inject_mode() {
+        return SessionSelection::Absent;
+    }
+    let signature = std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE");
+    if signature.is_none() && !super::wayland_input_enabled() {
+        return SessionSelection::Absent;
+    }
+    let resolved = (|| -> Result<Option<Session>> {
+        let runtime =
+            PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").context("missing XDG_RUNTIME_DIR")?);
+        if !runtime.is_absolute() {
+            bail!("XDG_RUNTIME_DIR must be absolute");
+        }
+        let wayland_path = named_wayland_path(&runtime)?;
+        if let Some(signature) = signature {
+            let signature = signature
+                .to_str()
+                .context("invalid Hyprland instance signature")?;
+            if !valid_signature(signature) {
+                bail!("invalid Hyprland instance signature");
+            }
+            // An explicit signature, including a stale or invalid one, is
+            // authoritative: never scan for a replacement desktop.
+            return Ok(Some(Session {
+                ipc_path: runtime.join("hypr").join(signature).join(".socket.sock"),
+                wayland_path,
+                peer: OnceLock::new(),
+            }));
+        }
+        discover_session(&runtime, wayland_path)
+    })();
+    match resolved {
+        Ok(Some(session)) => SessionSelection::Ready(session),
+        Ok(None) => SessionSelection::Absent,
+        Err(error) => SessionSelection::Refused(format!("{error:#}")),
+    }
+}
+
+fn session_selection() -> &'static SessionSelection {
+    &SESSION
+}
+
+pub fn is_session() -> bool {
+    !matches!(session_selection(), SessionSelection::Absent)
+}
+
+fn session() -> Result<&'static Session> {
+    match session_selection() {
+        SessionSelection::Ready(session) => Ok(session),
+        SessionSelection::Absent => bail!("no attested Hyprland instance for this Wayland display"),
+        SessionSelection::Refused(error) => bail!("Hyprland session refused: {error}"),
+    }
+}
+
+fn valid_signature(signature: &str) -> bool {
+    !signature.is_empty()
+        && signature != "."
+        && signature != ".."
+        && signature
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
+fn named_wayland_path(runtime: &Path) -> Result<PathBuf> {
+    if std::env::var_os("WAYLAND_SOCKET").is_some() {
+        bail!("Hyprland requires a named WAYLAND_DISPLAY socket");
+    }
+    let display =
+        PathBuf::from(std::env::var_os("WAYLAND_DISPLAY").context("missing WAYLAND_DISPLAY")?);
+    if display.is_absolute() {
+        return Ok(display);
+    }
+    if display.components().count() != 1
+        || !matches!(
+            display.components().next(),
+            Some(std::path::Component::Normal(_))
+        )
     {
-        bail!("invalid Hyprland instance signature");
+        bail!("invalid WAYLAND_DISPLAY socket name");
     }
-    let runtime = PathBuf::from(runtime);
-    if !runtime.is_absolute() {
-        bail!("XDG_RUNTIME_DIR must be absolute");
+    Ok(runtime.join(display))
+}
+
+fn socket_connection(path: &Path, timeout: Duration) -> Result<UnixStream> {
+    let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
+    socket.connect_timeout(&socket2::SockAddr::unix(path)?, timeout)?;
+    Ok(socket.into())
+}
+
+fn discover_session(runtime: &Path, wayland_path: PathBuf) -> Result<Option<Session>> {
+    let entries = match std::fs::read_dir(runtime.join("hypr")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("Hyprland instance directory unavailable"),
+    };
+    let deadline = Instant::now() + QUERY_TIMEOUT;
+    let wayland = socket_connection(&wayland_path, query_time_remaining(deadline)?)?;
+    let compositor = peer_pid(wayland.as_raw_fd())?;
+    let mut selected = None;
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_INSTANCE_ENTRIES {
+            bail!("Hyprland instance discovery exceeded its bounded directory limit");
+        }
+        query_time_remaining(deadline)?;
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() || !entry.file_name().to_str().is_some_and(valid_signature)
+        {
+            continue;
+        }
+        let ipc_path = entry.path().join(".socket.sock");
+        let ipc = match socket_connection(&ipc_path, query_time_remaining(deadline)?) {
+            Ok(ipc) => ipc,
+            Err(_) => continue,
+        };
+        if peer_pid(ipc.as_raw_fd()).ok() != Some(compositor) {
+            continue;
+        }
+        if selected.is_some() {
+            bail!("multiple Hyprland IPC instances attest to the named Wayland compositor");
+        }
+        selected = Some(ipc_path);
     }
-    Ok(runtime.join("hypr").join(signature).join(".socket.sock"))
+    Ok(selected.map(|ipc_path| Session {
+        ipc_path,
+        wayland_path,
+        peer: OnceLock::from(compositor),
+    }))
+}
+
+fn verify_session_peer(peer: libc::pid_t) -> Result<()> {
+    let expected = *session()?.peer.get_or_init(|| peer);
+    if peer != expected {
+        bail!("Hyprland compositor changed during the driver session");
+    }
+    Ok(())
 }
 
 pub(super) fn peer_pid(fd: RawFd) -> Result<libc::pid_t> {
@@ -120,9 +255,7 @@ fn ipc_connection() -> Result<UnixStream> {
 }
 
 fn ipc_connection_with_timeout(timeout: Duration) -> Result<UnixStream> {
-    let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
-    socket.connect_timeout(&socket2::SockAddr::unix(ipc_path()?)?, timeout)?;
-    Ok(socket.into())
+    socket_connection(&session()?.ipc_path, timeout)
 }
 
 /// Bound the socket connection as well as protocol dispatch. Inherited
@@ -133,60 +266,46 @@ pub(super) fn wayland_connection() -> Result<wayland_client::Connection> {
 }
 
 fn wayland_connection_with_timeout(timeout: Duration) -> Result<wayland_client::Connection> {
-    if std::env::var_os("WAYLAND_SOCKET").is_some() {
-        bail!("Hyprland observation requires a named WAYLAND_DISPLAY socket");
-    }
-    let display =
-        PathBuf::from(std::env::var_os("WAYLAND_DISPLAY").context("missing WAYLAND_DISPLAY")?);
-    let path = if display.is_absolute() {
-        display
-    } else {
-        if display.components().count() != 1 {
-            bail!("invalid WAYLAND_DISPLAY socket name");
-        }
-        let runtime =
-            PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").context("missing XDG_RUNTIME_DIR")?);
-        if !runtime.is_absolute() {
-            bail!("XDG_RUNTIME_DIR must be absolute");
-        }
-        runtime.join(display)
-    };
-    let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
-    socket.connect_timeout(&socket2::SockAddr::unix(path)?, timeout)?;
-    wayland_client::Connection::from_socket(socket.into()).context("Wayland connection failed")
+    let socket = socket_connection(&session()?.wayland_path, timeout)?;
+    verify_session_peer(peer_pid(socket.as_raw_fd())?)?;
+    wayland_client::Connection::from_socket(socket).context("Wayland connection failed")
 }
 
 /// Bind the Wayland connection to the IPC compositor before accepting pixels.
 pub(super) fn verify_capture_peer(connection: &wayland_client::Connection) -> Result<()> {
     let ipc = ipc_connection()?;
-    if peer_pid(ipc.as_raw_fd())? != peer_pid(connection.backend().poll_fd().as_raw_fd())? {
+    let peer = peer_pid(ipc.as_raw_fd())?;
+    if peer != peer_pid(connection.backend().poll_fd().as_raw_fd())? {
         bail!("Hyprland IPC and WAYLAND_DISPLAY name different compositor processes");
     }
+    verify_session_peer(peer)?;
     Ok(())
 }
 
+fn attested_ipc_connection(deadline: Instant) -> Result<UnixStream> {
+    let ipc = ipc_connection_with_timeout(query_time_remaining(deadline)?)?;
+    // A stale inherited signature must never name a different nested desktop.
+    // Pin the peer for the entire driver session, including focus and restore.
+    let wayland = wayland_connection_with_timeout(query_time_remaining(deadline)?)?;
+    let peer = peer_pid(ipc.as_raw_fd())?;
+    if peer != peer_pid(wayland.backend().poll_fd().as_raw_fd())? {
+        bail!("Hyprland IPC and WAYLAND_DISPLAY name different compositor processes");
+    }
+    verify_session_peer(peer)?;
+    Ok(ipc)
+}
+
 fn query<T: serde::de::DeserializeOwned>(command: &str) -> Result<T> {
-    let mut expected_peer = None;
+    query_before(command, Instant::now() + QUERY_TOTAL_TIMEOUT)
+}
+
+fn query_before<T: serde::de::DeserializeOwned>(command: &str, deadline: Instant) -> Result<T> {
     query_with(
         command,
         QUERY_TIMEOUT,
-        QUERY_TOTAL_TIMEOUT,
+        query_time_remaining(deadline)?,
         QUERY_RETRY_BACKOFF,
-        |deadline| {
-            let ipc = ipc_connection_with_timeout(query_time_remaining(deadline)?)?;
-            // A stale inherited instance signature must not supply geometry for
-            // a different nested desktop. Re-attest both sockets on every try.
-            let wayland = wayland_connection_with_timeout(query_time_remaining(deadline)?)?;
-            let peer = peer_pid(ipc.as_raw_fd())?;
-            if peer != peer_pid(wayland.backend().poll_fd().as_raw_fd())? {
-                bail!("Hyprland IPC and WAYLAND_DISPLAY name different compositor processes");
-            }
-            if expected_peer.is_some_and(|expected| expected != peer) {
-                bail!("Hyprland compositor changed during observation retry");
-            }
-            expected_peer = Some(peer);
-            Ok(ipc)
-        },
+        attested_ipc_connection,
     )
 }
 
@@ -374,16 +493,190 @@ pub fn window_for_pid(pid: u32) -> Option<Window> {
     owned.next().is_none().then_some(first)
 }
 
-pub fn target_is_active(address: u64, pid: Option<u32>) -> Result<bool> {
-    let target = window_for_address(address).context("Hyprland target no longer exists")?;
-    if pid.is_some_and(|pid| pid != target.pid) {
-        bail!("Hyprland target belongs to a different process");
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TargetIdentity {
+    address: u64,
+    pid: u32,
+}
+
+fn focus_target(windows: &[Window], target: TargetIdentity) -> Result<()> {
+    let window = windows
+        .iter()
+        .find(|window| window.address == target.address)
+        .context("foreground_unavailable: exact Hyprland window no longer exists")?;
+    if window.pid != target.pid || window.hidden {
+        bail!("foreground_unavailable: exact Hyprland target ownership/visibility is unproven");
     }
-    let active: serde_json::Value = query("j/activewindow")?;
-    Ok(
-        active.get("address").and_then(|v| v.as_str()) == Some(format!("0x{address:x}").as_str())
-            && active.get("pid").and_then(|v| v.as_u64()) == Some(u64::from(target.pid)),
-    )
+    Ok(())
+}
+
+fn focus_from_active(active: &serde_json::Value) -> Result<Option<TargetIdentity>> {
+    let object = active
+        .as_object()
+        .context("invalid Hyprland activewindow reply")?;
+    if object.is_empty() {
+        return Ok(None);
+    }
+    let address = active
+        .get("address")
+        .and_then(|value| value.as_str())
+        .and_then(|address| address.strip_prefix("0x"))
+        .context("invalid Hyprland active window address")?;
+    let address = u64::from_str_radix(address, 16)?;
+    let pid = u32::try_from(
+        active
+            .get("pid")
+            .and_then(|value| value.as_u64())
+            .context("invalid Hyprland active window PID")?,
+    )?;
+    if address == 0 || pid == 0 {
+        bail!("invalid Hyprland active window identity");
+    }
+    Ok(Some(TargetIdentity { address, pid }))
+}
+
+fn active_target(deadline: Instant) -> Result<Option<TargetIdentity>> {
+    focus_from_active(&query_before("j/activewindow", deadline)?)
+}
+
+fn verify_live_target(target: TargetIdentity, deadline: Instant) -> Result<()> {
+    let windows = windows_from_clients(query_before("j/clients", deadline)?, &HashSet::new())?;
+    focus_target(&windows, target)
+}
+
+fn prior_focus(deadline: Instant) -> Result<Option<TargetIdentity>> {
+    let prior = active_target(deadline)?;
+    if let Some(prior) = prior {
+        verify_live_target(prior, deadline)?;
+    }
+    Ok(prior)
+}
+
+/// Recheck after child AX focus or any readiness wait, without reactivating a
+/// lost target. A changed focus refuses; no uncertain input is replayed.
+pub fn require_target_focus(address: u64, pid: u32) -> Result<()> {
+    let target = TargetIdentity { address, pid };
+    let deadline = Instant::now() + QUERY_TOTAL_TIMEOUT;
+    verify_live_target(target, deadline)?;
+    if active_target(deadline)? != Some(target) {
+        bail!("foreground_unavailable: Hyprland focus changed; no keyboard input was sent");
+    }
+    Ok(())
+}
+
+fn focus_once(target: TargetIdentity, deadline: Instant) -> Result<()> {
+    // Qualified stock Hyprland's Lua dispatcher, using only a numeric full
+    // address. Never try a title selector or another mutation after uncertainty.
+    let command = format!(
+        "/dispatch hl.dsp.focus({{ window = \"address:0x{:x}\" }})",
+        target.address
+    );
+    let mut ipc = attested_ipc_connection(deadline)?;
+    let reply = read_reply(
+        &mut ipc,
+        command.as_bytes(),
+        query_time_remaining(deadline)?,
+    )?;
+    if std::str::from_utf8(&reply)?.trim() != "ok" {
+        bail!("foreground_unavailable: Hyprland did not acknowledge exact-address focus");
+    }
+    Ok(())
+}
+
+fn switch_focus(target: TargetIdentity, expected: Option<TargetIdentity>) -> Result<()> {
+    let deadline = Instant::now() + FOCUS_TIMEOUT;
+    verify_live_target(target, deadline)?;
+    if active_target(deadline)? != expected {
+        bail!("foreground_unavailable: Hyprland focus changed before activation");
+    }
+    focus_once(target, deadline)?;
+    loop {
+        let active = active_target(deadline)?;
+        if active == Some(target) {
+            return Ok(());
+        }
+        if active != expected {
+            bail!("foreground_unavailable: independent Hyprland focus change during activation");
+        }
+        std::thread::sleep(FOCUS_POLL_INTERVAL.min(query_time_remaining(deadline)?));
+    }
+}
+
+fn restore_prior(target: TargetIdentity, prior: Option<TargetIdentity>) -> Result<()> {
+    let deadline = Instant::now() + QUERY_TOTAL_TIMEOUT;
+    if active_target(deadline)? != Some(target) {
+        bail!("Hyprland focus changed independently; prior focus was not overwritten");
+    }
+    verify_live_target(target, deadline)?;
+    if let Some(prior) = prior.filter(|prior| *prior != target) {
+        verify_live_target(prior, deadline)?;
+        switch_focus(prior, Some(target))?;
+        require_target_focus(prior.address, prior.pid)?;
+    }
+    Ok(())
+}
+
+fn finish_focus<T>(result: Result<T>, restore: Result<()>) -> Result<T> {
+    match (result, restore) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(anyhow::anyhow!(
+            "foreground_effect_unknown: the foreground operation returned without application-effect verification; final focus/restore failed: {error:#}"
+        )),
+        (Err(error), Err(restore)) => Err(anyhow::anyhow!(
+            "Hyprland foreground operation failed: {error:#}; prior focus also could not be restored: {restore:#}"
+        )),
+    }
+}
+
+static FOCUS_TRANSACTION: Mutex<()> = Mutex::new(());
+
+/// Explicit foreground activation leaves the exact target focused on success.
+pub fn activate_window(address: u64, pid: u32) -> Result<()> {
+    let _transaction = FOCUS_TRANSACTION
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Hyprland foreground transaction lock poisoned"))?;
+    let target = TargetIdentity { address, pid };
+    let deadline = Instant::now() + QUERY_TOTAL_TIMEOUT;
+    verify_live_target(target, deadline)?;
+    let prior = prior_focus(deadline)?;
+    let result = if prior == Some(target) {
+        require_target_focus(address, pid)
+    } else {
+        switch_focus(target, prior).and_then(|()| require_target_focus(address, pid))
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => finish_focus(Err(error), restore_prior(target, prior)),
+    }
+}
+
+/// Focus/readback permits opt-in foreground virtual-keyboard input; it is NOT
+/// compositor-atomic binding. A user/compositor can change focus between the
+/// final check and an event during this short action. The mutex serializes only
+/// driver transactions. Application effect remains unverifiable until observed.
+pub fn with_focused_window<T>(
+    pid: u32,
+    address: u64,
+    body: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let _transaction = FOCUS_TRANSACTION
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Hyprland foreground transaction lock poisoned"))?;
+    let target = TargetIdentity { address, pid };
+    let deadline = Instant::now() + QUERY_TOTAL_TIMEOUT;
+    verify_live_target(target, deadline)?;
+    let prior = prior_focus(deadline)?;
+    let result = (|| {
+        if prior != Some(target) {
+            switch_focus(target, prior)?;
+        }
+        require_target_focus(address, pid)?;
+        body()
+    })();
+    // Restore after operation/activation failures too, but never over an
+    // independently observed focus change or a dead/stale prior identity.
+    finish_focus(result, restore_prior(target, prior))
 }
 
 fn capture_target(windows: &[Window], address: u64, pid: Option<u32>) -> Result<Window> {
@@ -460,6 +753,64 @@ mod tests {
         );
         assert!(capture_target(&windows, 0x30, Some(42)).is_err());
         assert!(capture_target(&windows, 0x10, Some(43)).is_err());
+    }
+
+    #[test]
+    fn foreground_identity_requires_full_live_address_and_exact_pid() {
+        let windows = [window(0x1ff000005, 42), window(0x2ff000005, 42)];
+        let target = TargetIdentity {
+            address: 0x1ff000005,
+            pid: 42,
+        };
+        assert!(focus_target(&windows, target).is_ok());
+        // A connection-local foreign handle cannot borrow a matching low word,
+        // nor can a stale ID borrow a same-PID sibling's native authority.
+        assert!(focus_target(
+            &windows,
+            TargetIdentity {
+                address: 0xff000005,
+                ..target
+            },
+        )
+        .is_err());
+        assert!(focus_target(
+            &windows,
+            TargetIdentity {
+                address: 0x3ff000005,
+                ..target
+            },
+        )
+        .is_err());
+        assert!(focus_target(&windows, TargetIdentity { pid: 43, ..target }).is_err());
+        let mut hidden = window(target.address, target.pid);
+        hidden.hidden = true;
+        assert!(focus_target(&[hidden], target).is_err());
+    }
+
+    #[test]
+    fn active_focus_readback_preserves_full_address_and_owner() {
+        let active = focus_from_active(&serde_json::json!({
+            "address": "0x1234ff000005", "pid": 42,
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            active,
+            TargetIdentity {
+                address: 0x1234ff000005,
+                pid: 42
+            },
+        );
+        assert_eq!(focus_from_active(&serde_json::json!({})).unwrap(), None);
+        for reply in [
+            serde_json::json!({"address":"0xff000005"}),
+            serde_json::json!({"address":"0x0","pid":42}),
+            serde_json::json!({"address":"0x1234ff000005","pid":0}),
+            serde_json::json!({"address":"0x1234ff000005","pid":-1}),
+            serde_json::json!({"address":"0x1234ff000005","pid":u64::MAX}),
+        ] {
+            assert!(focus_from_active(&reply).is_err());
+        }
     }
 
     #[test]

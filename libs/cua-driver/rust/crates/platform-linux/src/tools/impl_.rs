@@ -14,7 +14,7 @@ use cua_driver_core::{
 use serde_json::{json, Value};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 
 use crate::atspi::ElementCache;
 use cursor_overlay::CursorRegistry;
@@ -2079,6 +2079,58 @@ fn hyprland_foreground(delivery: crate::input::delivery::DeliveryMode) -> bool {
         && crate::wayland::hyprland::is_session()
 }
 
+fn hyprland_keyboard_plugin_foreground(delivery: crate::input::delivery::DeliveryMode) -> bool {
+    // Preserve the existing explicitly experimental / discovered plugin lane.
+    // Select once: plugin loss after selection must refuse, never downgrade to
+    // the weaker stock focus/readback transport on a later action.
+    static PLUGIN_SELECTED: LazyLock<bool> = LazyLock::new(crate::wayland::hyprland_input::enabled);
+    hyprland_foreground(delivery) && *PLUGIN_SELECTED
+}
+
+fn stock_hyprland_keyboard_result(
+    delivery: crate::input::delivery::DeliveryMode,
+    result: ToolResult,
+) -> ToolResult {
+    if !hyprland_foreground(delivery) || hyprland_keyboard_plugin_foreground(delivery) {
+        return result;
+    }
+    use cua_driver_core::action_record::{
+        ActionEffect, ActionExecutionRecord, ActionTransport, ActualDelivery, RequestedDelivery,
+    };
+    let record = ActionExecutionRecord::builder(
+        ActionEffect::Unverifiable,
+        ActionTransport::LinuxWaylandVirtualKeyboard,
+        RequestedDelivery::Foreground,
+    )
+    .actual_delivery(ActualDelivery::Foreground)
+    .build()
+    .expect("focus-checked stock keyboard input has no application-effect evidence");
+    result.with_action_record(record)
+}
+
+fn hyprland_keyboard_exact_window_refusal(
+    delivery: crate::input::delivery::DeliveryMode,
+) -> ToolResult {
+    if hyprland_keyboard_plugin_foreground(delivery) {
+        return foreground_hyprland_refusal("an exact window_id is required");
+    }
+    use cua_driver_core::action_record::{
+        ActionEffect, ActionExecutionRecord, ActionTransport, RequestedDelivery,
+    };
+    let record = ActionExecutionRecord::builder(
+        ActionEffect::Refused,
+        ActionTransport::LinuxWaylandVirtualKeyboard,
+        RequestedDelivery::Foreground,
+    )
+    .detail("an exact window_id or window-bound element token is required")
+    .build()
+    .expect("refusal before stock keyboard input has no delivered count");
+    ToolResult::error(
+        "foreground_unavailable: Hyprland keyboard input requires an exact window_id or window-bound element token",
+    )
+    .with_action_record(record)
+}
+
 fn element_click_prefers_ax(
     hyprland_foreground: bool,
     button: u8,
@@ -4074,6 +4126,10 @@ impl Tool for TypeTextTool {
             cua_driver_core::element_token::ResolvedElement::None => (None, None),
         };
         let xid_opt = args.opt_u64("window_id").or(resolved_window_id);
+        let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
+        if hyprland_foreground(delivery) && xid_opt.is_none() {
+            return hyprland_keyboard_exact_window_refusal(delivery);
+        }
 
         // Resolve XID: use window_id if given, else first window for pid.
         let xid = match xid_opt {
@@ -4093,7 +4149,6 @@ impl Tool for TypeTextTool {
                 }
             }
         };
-        let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
         if isolated_hyprland_background(delivery)
             && resolved_elem_idx.is_none()
             && args.get("x").is_none()
@@ -4148,10 +4203,7 @@ impl Tool for TypeTextTool {
             );
         }
 
-        if hyprland_foreground(delivery) {
-            if xid_opt.is_none() {
-                return foreground_hyprland_refusal("an exact window_id is required");
-            }
+        if hyprland_keyboard_plugin_foreground(delivery) {
             // Native editables retain their verifiable, addressed AT-SPI route.
             if !is_chromium_embedder(pid) && !is_webkitgtk_embedder(pid) {
                 if let Some(index) = resolved_elem_idx {
@@ -4334,14 +4386,17 @@ impl Tool for TypeTextTool {
                 })
                 .await;
                 return match result {
-                    Ok(Ok(())) => ToolResult::text(format!(
-                        "Typed {text_len} character(s) (via Wayland virtual-keyboard)."
-                    ))
-                    .with_structured(type_text_structured(
-                        "key_events",
-                        text_len,
-                        false,
-                    )),
+                    Ok(Ok(())) => stock_hyprland_keyboard_result(
+                        delivery,
+                        ToolResult::text(format!(
+                            "Typed {text_len} character(s) (via Wayland virtual-keyboard)."
+                        ))
+                        .with_structured(type_text_structured(
+                            "key_events",
+                            text_len,
+                            false,
+                        )),
+                    ),
                     Ok(Err(error)) => ToolResult::error(error.to_string()),
                     Err(error) => ToolResult::error(format!("Task error: {error}")),
                 };
@@ -4351,7 +4406,7 @@ impl Tool for TypeTextTool {
         // AX addressing names one exact editable. Try this focus-free route
         // before native Wayland keyboard injection, which can only target the
         // compositor's globally focused surface.
-        if let Some(idx) = resolved_elem_idx {
+        if let Some(idx) = resolved_elem_idx.filter(|_| !hyprland_foreground(delivery)) {
             let text_at = text.clone();
             let targeted = tokio::task::spawn_blocking(move || {
                 crate::atspi::type_into_editable_at(pid, idx, &text_at)
@@ -4397,14 +4452,17 @@ impl Tool for TypeTextTool {
             })
             .await;
             return match result {
-                Ok(Ok(())) => ToolResult::text(format!(
-                    "Typed {text_len} character(s) (via Wayland virtual-keyboard)."
-                ))
-                .with_structured(type_text_structured(
-                    "key_events",
-                    text_len,
-                    false,
-                )),
+                Ok(Ok(())) => stock_hyprland_keyboard_result(
+                    delivery,
+                    ToolResult::text(format!(
+                        "Typed {text_len} character(s) (via Wayland virtual-keyboard)."
+                    ))
+                    .with_structured(type_text_structured(
+                        "key_events",
+                        text_len,
+                        false,
+                    )),
+                ),
                 Ok(Err(e)) => ToolResult::error(e.to_string()),
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
             };
@@ -4802,6 +4860,10 @@ impl Tool for PressKeyTool {
             }
             cua_driver_core::element_token::ResolvedElement::None => window_id_arg,
         };
+        let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
+        if hyprland_foreground(delivery) && xid_opt.is_none() {
+            return hyprland_keyboard_exact_window_refusal(delivery);
+        }
         let xid = match xid_opt {
             Some(x) => x,
             None => {
@@ -4824,7 +4886,6 @@ impl Tool for PressKeyTool {
         // Reuses click's translation + delivery_mode; after it, deliver via the plain
         // background path (the focus-click already handled fronting when fg). Pass x,y
         // (no element_index) for Chromium/Electron surfaces the AX path can't focus.
-        let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
         if isolated_hyprland_background(delivery) {
             if xid_opt.is_none() {
                 return isolated_hyprland_refusal(
@@ -4875,10 +4936,7 @@ impl Tool for PressKeyTool {
             );
         }
 
-        if hyprland_foreground(delivery) {
-            if xid_opt.is_none() {
-                return foreground_hyprland_refusal("an exact window_id is required");
-            }
+        if hyprland_keyboard_plugin_foreground(delivery) {
             let action = match foreground_hyprland_key(key, mods) {
                 Ok(action) => action,
                 Err(error) => return error,
@@ -4989,9 +5047,12 @@ impl Tool for PressKeyTool {
             })
             .await;
             return match result {
-                Ok(Ok(())) => ToolResult::text(format!(
-                    "Pressed key '{key}' (via Wayland virtual-keyboard)."
-                )),
+                Ok(Ok(())) => stock_hyprland_keyboard_result(
+                    delivery,
+                    ToolResult::text(format!(
+                        "Pressed key '{key}' (via Wayland virtual-keyboard)."
+                    )),
+                ),
                 Ok(Err(e)) => ToolResult::error(e.to_string()),
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
             };
@@ -5178,6 +5239,10 @@ impl Tool for HotkeyTool {
             }
             cua_driver_core::element_token::ResolvedElement::None => window_id_arg,
         };
+        let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
+        if hyprland_foreground(delivery) && xid_opt.is_none() {
+            return hyprland_keyboard_exact_window_refusal(delivery);
+        }
 
         // Resolve XID: use window_id if given, else first window for pid.
         let xid = match xid_opt {
@@ -5222,7 +5287,6 @@ impl Tool for HotkeyTool {
         let key_display = format!("{}+{}", mods.join("+"), key);
         let key_for_wayland = key.clone();
         let mods_for_wayland = mods.clone();
-        let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
 
         if isolated_hyprland_background(delivery) {
             if xid_opt.is_none() {
@@ -5284,10 +5348,7 @@ impl Tool for HotkeyTool {
             );
         }
 
-        if hyprland_foreground(delivery) {
-            if xid_opt.is_none() {
-                return foreground_hyprland_refusal("an exact window_id is required");
-            }
+        if hyprland_keyboard_plugin_foreground(delivery) {
             if let Some(keys) = args.get("keys").and_then(Value::as_array) {
                 if keys.iter().any(|key| !key.is_string())
                     || keys
@@ -5377,7 +5438,9 @@ impl Tool for HotkeyTool {
             }
         }
 
-        if let Some(element_index) = resolved_element_index {
+        if let Some(element_index) =
+            resolved_element_index.filter(|_| !hyprland_foreground(delivery))
+        {
             let focused = tokio::task::spawn_blocking(move || {
                 crate::atspi::focus_element(pid, element_index)
             })
@@ -5424,11 +5487,20 @@ impl Tool for HotkeyTool {
 
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             if crate::wayland::wayland_input_enabled() {
-                // Native Wayland: route the modifier combo through wtype's
-                // -M/-k/-m sequence — the closest equivalent to the X11
-                // state-mask path. window_id is irrelevant once focused.
                 let mut combo: Vec<String> = mods_for_wayland.clone();
                 combo.push(key_for_wayland.clone());
+                if crate::wayland::hyprland::is_session() {
+                    return crate::wayland::with_target_foreground(pid, xid, || {
+                        if let Some(index) = resolved_element_index {
+                            if !crate::atspi::focus_element(pid, index)? {
+                                anyhow::bail!(
+                                    "AT-SPI Component.GrabFocus returned false for element {index}"
+                                );
+                            }
+                        }
+                        crate::wayland::hotkey_focused(&combo)
+                    });
+                }
                 return crate::wayland::hotkey(xid, &combo);
             }
             let m: Vec<&str> = mods.iter().map(String::as_str).collect();
@@ -5454,10 +5526,13 @@ impl Tool for HotkeyTool {
             "background"
         };
         match result {
-            Ok(Ok(())) => ToolResult::text(format!(
-                "Pressed {key_display} on pid {pid} (delivery_mode={mode_label})."
-            ))
-            .with_structured(json!({ "verified": false, "delivery_mode": mode_label })),
+            Ok(Ok(())) => stock_hyprland_keyboard_result(
+                delivery,
+                ToolResult::text(format!(
+                    "Pressed {key_display} on pid {pid} (delivery_mode={mode_label})."
+                ))
+                .with_structured(json!({ "verified": false, "delivery_mode": mode_label })),
+            ),
             Ok(Err(e)) => ToolResult::error(e.to_string()),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
