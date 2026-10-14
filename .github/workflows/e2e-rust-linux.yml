@@ -1,4 +1,5 @@
 name: "E2E: Rust Linux interactive"
+# Keep this canonical dispatch workflow indexed on the default branch.
 
 on:
   workflow_dispatch:
