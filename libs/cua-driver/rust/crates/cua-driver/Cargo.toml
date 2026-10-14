@@ -61,6 +61,7 @@ windows = { version = "0.61", features = [
 
 [target.'cfg(target_os = "linux")'.dependencies]
 platform-linux = { path = "../platform-linux" }
+x11rb = { version = "0.13", features = ["res"] }
 
 [features]
 default = []
