@@ -565,6 +565,8 @@ pub fn parse_command() -> Command {
         println!("                                      Revocation is deny-only and never needs a token.");
         println!();
         println!("mcp options:");
+        println!("  --idle-click-policy <path> Linux-only trusted-launcher, single-use X11 SendEvent gate.");
+        println!("                          No overlay, seat input, capture or fallback; other input refuses.");
         println!("  --direct                Own the runtime in this MCP process. On macOS this");
         println!("                          deliberately attributes TCC to the invoking host.");
         println!("                          Mutually exclusive with --socket.");
@@ -1792,6 +1794,16 @@ pub fn build_manifest() -> serde_json::Value {
         cfg!(feature = "portal-input"),
         cfg!(feature = "portal-capture"),
     );
+    let idle_policy = crate::idle_click::configured_path();
+    let mcp_args = match &idle_policy {
+        Some(path) => vec![
+            "mcp".to_owned(),
+            "--idle-click-policy".to_owned(),
+            path.clone(),
+            "--no-overlay".to_owned(),
+        ],
+        None => vec!["mcp".to_owned()],
+    };
 
     serde_json::json!({
         // `schema_version` is bumped only on a breaking change to the
@@ -1808,10 +1820,12 @@ pub fn build_manifest() -> serde_json::Value {
             "wayland_native": wayland_native,
             "portal_input": portal_input,
             "portal_capture": portal_capture,
+            "idle_click_send_event": cfg!(target_os = "linux"),
         },
+        "idle_click": { "enabled": idle_policy.is_some(), "capability": crate::idle_click::CAPABILITY, "single_use": true, "path": "x11_send_event" },
         "mcp_invocation": {
             "command": binary,
-            "args": ["mcp"]
+            "args": mcp_args
         },
         // Subcommand catalog — keep in sync with `parse_command` above.
         // `args` is a hint shape for consumers; the canonical source is
@@ -1822,6 +1836,7 @@ pub fn build_manifest() -> serde_json::Value {
               "description": "Run the MCP stdio server: direct runtime on Windows/Linux, app-daemon proxy on macOS, or explicit service with --socket.",
               "args": [
                   { "name": "--socket", "type": "string", "description": "Select an explicit daemon socket or named-pipe endpoint." },
+                  { "name": "--idle-click-policy", "type": "string", "description": "Linux X11/XWayland trusted-launcher policy for one SendEvent-only idle-gated click; no overlay or fallback." },
                   { "name": "--direct", "type": "flag", "description": "Own the runtime in the MCP process; on macOS this explicitly accepts host TCC attribution. Mutually exclusive with --socket." },
                   { "name": "--claude-code-computer-use-compat", "type": "flag", "description": "Select the Claude Code computer-use compat tool surface." },
                   { "name": "--embedded", "type": "flag", "description": "Declare embedding-host mode. Without --direct, requires the host's private service through --socket instead of auto-launching the standalone app." },

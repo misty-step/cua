@@ -24,6 +24,9 @@ mod cli;
 mod doctor;
 mod driver_service_http;
 mod history_runtime;
+mod idle_click;
+#[cfg(target_os = "linux")]
+mod idle_click_mcp;
 mod mcp_envelope;
 mod mcp_http;
 mod private_worker;
@@ -458,6 +461,13 @@ mod mcp_runtime_selection_tests {
 
 #[cfg(target_os = "macos")]
 fn main() {
+    if let Some(result) = idle_click::entrypoint() {
+        if let Err(error) = result {
+            eprintln!("cua-driver: {error}");
+            std::process::exit(64);
+        }
+        return;
+    }
     if let Some(code) = platform_macos::permissions::gate::run_permission_probe_if_requested() {
         std::process::exit(code);
     }
@@ -882,6 +892,9 @@ fn main() {
 
 #[cfg(not(target_os = "macos"))]
 fn main() -> anyhow::Result<()> {
+    if let Some(result) = idle_click::entrypoint() {
+        return result;
+    }
     if let Some(code) = history_runtime::run_offline_purge_if_requested() {
         std::process::exit(code);
     }
